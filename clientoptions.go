@@ -94,7 +94,21 @@ func WithHttpConnection(ctx context.Context, address string, options ...func(*ht
 func WithReceiver(receiver interface{}) func(Party) error {
 	return func(party Party) error {
 		if client, ok := party.(*client); ok {
-			client.receiver = receiver
+			client.receiver = &reflectInvocationReceiver{receiver}
+			if receiver, ok := receiver.(ReceiverInterface); ok {
+				receiver.Init(client)
+			}
+			return nil
+		}
+		return errors.New("option WithReceiver is client only")
+	}
+}
+
+// WithRawReceiver sets the object which will receive server side calls to client methods (e.g. callbacks)
+func WithRawReceiver(receiver RawReceiver) func(Party) error {
+	return func(party Party) error {
+		if client, ok := party.(*client); ok {
+			client.receiver = &rawInvocationReceiver{receiver}
 			if receiver, ok := receiver.(ReceiverInterface); ok {
 				receiver.Init(client)
 			}

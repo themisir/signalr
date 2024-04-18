@@ -159,7 +159,7 @@ type client struct {
 	err               error
 	format            string
 	loop              *loop
-	receiver          interface{}
+	receiver          invocationReceiver
 	lastID            int64
 	backoffFactory    func() backoff.BackOff
 	cancelFunc        context.CancelFunc
@@ -541,7 +541,7 @@ func (c *client) onConnected(hubConnection) {}
 
 func (c *client) onDisconnected(hubConnection) {}
 
-func (c *client) invocationTarget(hubConnection) interface{} {
+func (c *client) invocationTarget(hubConnection) invocationReceiver {
 	return c.receiver
 }
 

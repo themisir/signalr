@@ -146,10 +146,10 @@ func (s *server) onDisconnected(hc hubConnection) {
 
 }
 
-func (s *server) invocationTarget(conn hubConnection) interface{} {
+func (s *server) invocationTarget(conn hubConnection) invocationReceiver {
 	hub := s.newHub()
 	hub.Initialize(s.newConnectionHubContext(conn))
-	return hub
+	return &reflectInvocationReceiver{hub}
 }
 
 func (s *server) allowReconnect() bool {

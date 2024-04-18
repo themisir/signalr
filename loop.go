@@ -5,23 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"runtime/debug"
-	"strings"
 	"sync/atomic"
 	"time"
 )
 
 type loop struct {
-	lastID       uint64 // Used with atomic: Must be first in struct to ensure 64bit alignment on 32bit architectures
-	party        Party
-	info         StructuredLogger
-	dbg          StructuredLogger
-	protocol     hubProtocol
-	hubConn      hubConnection
-	invokeClient *invokeClient
-	streamer     *streamer
-	streamClient *streamClient
-	closeMessage *closeMessage
+	lastID        uint64 // Used with atomic: Must be first in struct to ensure 64bit alignment on 32bit architectures
+	party         Party
+	info          StructuredLogger
+	dbg           StructuredLogger
+	protocol      hubProtocol
+	hubConn       hubConnection
+	invokeContext invocationContext
+	invokeClient  *invokeClient
+	streamer      *streamer
+	streamClient  *streamClient
+	closeMessage  *closeMessage
 }
 
 func newLoop(p Party, conn Connection, protocol hubProtocol) *loop {
@@ -30,15 +29,27 @@ func newLoop(p Party, conn Connection, protocol hubProtocol) *loop {
 	protocol.setDebugLogger(dbg)
 	pInfo, pDbg := p.prefixLoggers(conn.ConnectionID())
 	hubConn := newHubConnection(conn, protocol, p.maximumReceiveMessageSize(), pInfo)
-	return &loop{
+	streamClient := newStreamClient(protocol, p.chanReceiveTimeout(), p.streamBufferCapacity())
+	streamer := &streamer{conn: hubConn}
+	invokeContext := invocationContext{
+		hubConn:      hubConn,
 		party:        p,
 		protocol:     protocol,
-		hubConn:      hubConn,
-		invokeClient: newInvokeClient(protocol, p.chanReceiveTimeout()),
-		streamer:     &streamer{conn: hubConn},
-		streamClient: newStreamClient(protocol, p.chanReceiveTimeout(), p.streamBufferCapacity()),
+		streamClient: streamClient,
+		streamer:     streamer,
 		info:         pInfo,
 		dbg:          pDbg,
+	}
+	return &loop{
+		party:         p,
+		protocol:      protocol,
+		hubConn:       hubConn,
+		invokeContext: invokeContext,
+		invokeClient:  newInvokeClient(protocol, p.chanReceiveTimeout()),
+		streamer:      streamer,
+		streamClient:  streamClient,
+		info:          pInfo,
+		dbg:           pDbg,
 	}
 }
 
@@ -191,68 +202,8 @@ func (l *loop) GetNewID() string {
 
 func (l *loop) handleInvocationMessage(invocation invocationMessage) {
 	_ = l.dbg.Log(evt, msgRecv, msg, fmtMsg(invocation))
-	// Transient hub, dispatch invocation here
-	if method, ok := getMethod(l.party.invocationTarget(l.hubConn), invocation.Target); !ok {
-		// Unable to find the method
-		_ = l.info.Log(evt, "getMethod", "error", "missing method", "name", invocation.Target, react, "send completion with error")
-		_ = l.hubConn.Completion(invocation.InvocationID, nil, fmt.Sprintf("Unknown method %s", invocation.Target))
-	} else if in, err := buildMethodArguments(method, invocation, l.streamClient, l.protocol); err != nil {
-		// argument build failed
-		_ = l.info.Log(evt, "buildMethodArguments", "error", err, "name", invocation.Target, react, "send completion with error")
-		_ = l.hubConn.Completion(invocation.InvocationID, nil, err.Error())
-	} else {
-		// Stream invocation is only allowed when the method has only one return value
-		// We allow no channel return values, because a client can receive as stream with only one item
-		if invocation.Type == 4 && method.Type().NumOut() != 1 {
-			_ = l.hubConn.Completion(invocation.InvocationID, nil,
-				fmt.Sprintf("Stream invocation of method %s which has not return value kind channel", invocation.Target))
-		} else {
-			// hub method might take a long time
-			go func() {
-				result := func() []reflect.Value {
-					defer l.recoverInvocationPanic(invocation)
-					return method.Call(in)
-				}()
-				l.returnInvocationResult(invocation, result)
-			}()
-		}
-	}
-}
-
-func (l *loop) returnInvocationResult(invocation invocationMessage, result []reflect.Value) {
-	// No invocation id, no completion
-	if invocation.InvocationID != "" {
-		// if the hub method returns a chan, it should be considered asynchronous or source for a stream
-		if len(result) == 1 && result[0].Kind() == reflect.Chan {
-			switch invocation.Type {
-			// Simple invocation
-			case 1:
-				go func() {
-					// Recv might block, so run continue in a goroutine
-					if chanResult, ok := result[0].Recv(); ok {
-						l.sendResult(invocation, completion, []reflect.Value{chanResult})
-					} else {
-
-						_ = l.hubConn.Completion(invocation.InvocationID, nil, "hub func returned closed chan")
-					}
-				}()
-			// StreamInvocation
-			case 4:
-				l.streamer.Start(invocation.InvocationID, result[0])
-			}
-		} else {
-			switch invocation.Type {
-			// Simple invocation
-			case 1:
-				l.sendResult(invocation, completion, result)
-			case 4:
-				// Stream invocation of method with no stream result.
-				// Return a single StreamItem and an empty Completion
-				l.sendResult(invocation, streamItem, result)
-				_ = l.hubConn.Completion(invocation.InvocationID, nil, "")
-			}
-		}
-	}
+	recv := l.party.invocationTarget(l.hubConn)
+	recv.Handle(&l.invokeContext, invocation)
 }
 
 func (l *loop) handleStreamItemMessage(streamItemMessage streamItemMessage) error {
@@ -294,93 +245,6 @@ func (l *loop) handleOtherMessage(hubMessage hubMessage) error {
 		return err
 	}
 	return nil
-}
-
-func (l *loop) sendResult(invocation invocationMessage, connFunc connFunc, result []reflect.Value) {
-	values := make([]interface{}, len(result))
-	for i, rv := range result {
-		values[i] = rv.Interface()
-	}
-	switch len(result) {
-	case 0:
-		_ = l.hubConn.Completion(invocation.InvocationID, nil, "")
-	case 1:
-		connFunc(l, invocation, values[0])
-	default:
-		connFunc(l, invocation, values)
-	}
-}
-
-type connFunc func(sl *loop, invocation invocationMessage, value interface{})
-
-func completion(sl *loop, invocation invocationMessage, value interface{}) {
-	_ = sl.hubConn.Completion(invocation.InvocationID, value, "")
-}
-
-func streamItem(sl *loop, invocation invocationMessage, value interface{}) {
-
-	_ = sl.hubConn.StreamItem(invocation.InvocationID, value)
-}
-
-func (l *loop) recoverInvocationPanic(invocation invocationMessage) {
-	if err := recover(); err != nil {
-		_ = l.info.Log(evt, "panic in target method", "error", err, "name", invocation.Target, react, "send completion with error")
-		stack := string(debug.Stack())
-		_ = l.dbg.Log(evt, "panic in target method", "error", err, "name", invocation.Target, react, "send completion with error", "stack", stack)
-		if invocation.InvocationID != "" {
-			if !l.party.enableDetailedErrors() {
-				stack = ""
-			}
-			_ = l.hubConn.Completion(invocation.InvocationID, nil, fmt.Sprintf("%v\n%v", err, stack))
-		}
-	}
-}
-
-func buildMethodArguments(method reflect.Value, invocation invocationMessage,
-	streamClient *streamClient, protocol hubProtocol) (arguments []reflect.Value, err error) {
-	if len(invocation.StreamIds)+len(invocation.Arguments) != method.Type().NumIn() {
-		return nil, fmt.Errorf("parameter mismatch calling method %v", invocation.Target)
-	}
-	arguments = make([]reflect.Value, method.Type().NumIn())
-	chanCount := 0
-	for i := 0; i < method.Type().NumIn(); i++ {
-		t := method.Type().In(i)
-		// Is it a channel for client streaming?
-		if arg, clientStreaming, err := streamClient.buildChannelArgument(invocation, t, chanCount); err != nil {
-			// it is, but channel count in invocation and method mismatch
-			return nil, err
-		} else if clientStreaming {
-			// it is
-			chanCount++
-			arguments[i] = arg
-		} else {
-			// it is not, so do the normal thing
-			arg := reflect.New(t)
-			if err := protocol.UnmarshalArgument(invocation.Arguments[i-chanCount], arg.Interface()); err != nil {
-				return arguments, err
-			}
-			arguments[i] = arg.Elem()
-		}
-	}
-	if len(invocation.StreamIds) != chanCount {
-		return arguments, fmt.Errorf("to many StreamIds for channel parameters of method %v", invocation.Target)
-	}
-	return arguments, nil
-}
-
-func getMethod(target interface{}, name string) (reflect.Value, bool) {
-	hubType := reflect.TypeOf(target)
-	if hubType != nil {
-		hubValue := reflect.ValueOf(target)
-		name = strings.ToLower(name)
-		for i := 0; i < hubType.NumMethod(); i++ {
-			// Search in public methods
-			if m := hubType.Method(i); strings.ToLower(m.Name) == name {
-				return hubValue.Method(i), true
-			}
-		}
-	}
-	return reflect.Value{}, false
 }
 
 func fmtMsg(message interface{}) string {

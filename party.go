@@ -17,7 +17,7 @@ type Party interface {
 	onConnected(hc hubConnection)
 	onDisconnected(hc hubConnection)
 
-	invocationTarget(hc hubConnection) interface{}
+	invocationTarget(hc hubConnection) invocationReceiver
 
 	timeout() time.Duration
 	setTimeout(timeout time.Duration)
